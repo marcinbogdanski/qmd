@@ -12,7 +12,9 @@ import {
   LlamaLogLevel,
   type Llama,
   type LlamaModel,
+  type LlamaContext,
   type LlamaEmbeddingContext,
+  type LlamaGrammar,
   type Token as LlamaToken,
 } from "node-llama-cpp";
 import { homedir } from "os";
@@ -321,6 +323,126 @@ export interface LLM {
 }
 
 // =============================================================================
+// IdleResourceSlot - LRU/idle-cache for lazy GPU resources
+// =============================================================================
+
+type IdleResourceSlotConfig<T> = {
+  name: string;
+  create: () => Promise<T>;
+  dispose: (resource: T) => Promise<void>;
+  idleTimeoutMs: number;
+  canEvict?: () => boolean;
+};
+
+/**
+ * Generic lazy-create + idle-evict slot for GPU resources.
+ *
+ * Encapsulates: lazy creation, promise dedup, per-slot idle timeout, disposal.
+ * Each slot manages its own lifecycle independently — resources that haven't been
+ * used recently are evicted without affecting other resource groups.
+ */
+// Exported for testing only — allows tests to inspect/manipulate slot internals.
+// Not part of the public API.
+export class IdleResourceSlot<T> {
+  readonly config: IdleResourceSlotConfig<T>;
+  private resource: T | null = null;
+  private createPromise: Promise<T> | null = null;
+  private idleTimer: ReturnType<typeof setTimeout> | null = null;
+  private _disposed = false;
+
+  constructor(config: IdleResourceSlotConfig<T>) {
+    this.config = config;
+  }
+
+  /** Whether the resource is currently loaded (without triggering creation). */
+  get isLoaded(): boolean {
+    return this.resource !== null;
+  }
+
+  /** Peek at the current resource without triggering creation or touching the timer. */
+  get current(): T | null {
+    return this.resource;
+  }
+
+  /** Get the resource, creating it lazily if needed. Resets idle timer. */
+  async get(): Promise<T> {
+    if (this._disposed) {
+      throw new Error(`IdleResourceSlot "${this.config.name}" is disposed`);
+    }
+    if (this.resource !== null) {
+      this.touch();
+      return this.resource;
+    }
+    if (this.createPromise) {
+      return this.createPromise;
+    }
+    this.createPromise = (async () => {
+      const r = await this.config.create();
+      if (this._disposed) {
+        await this.config.dispose(r);
+        throw new Error(`IdleResourceSlot "${this.config.name}" was disposed during creation`);
+      }
+      this.resource = r;
+      this.touch();
+      return r;
+    })();
+    try {
+      return await this.createPromise;
+    } finally {
+      this.createPromise = null;
+    }
+  }
+
+  /** Reset idle timer without creating the resource. */
+  touch(): void {
+    this.clearTimer();
+    if (this.config.idleTimeoutMs > 0 && this.resource !== null) {
+      this.idleTimer = setTimeout(() => {
+        if (this.config.canEvict && !this.config.canEvict()) {
+          this.touch(); // reschedule
+          return;
+        }
+        this.evict().catch(err => {
+          console.error(`Error evicting idle ${this.config.name}:`, err);
+        });
+      }, this.config.idleTimeoutMs);
+      this.idleTimer.unref();
+    }
+  }
+
+  /** Evict (dispose) the resource if loaded. */
+  async evict(): Promise<void> {
+    this.clearTimer();
+    if (this.resource === null) return;
+    const r = this.resource;
+    this.resource = null;
+    await this.config.dispose(r);
+  }
+
+  /** Hard dispose — shutdown path. No canEvict check. Future get() throws. */
+  async dispose(): Promise<void> {
+    if (this._disposed) return;
+    this._disposed = true;
+    this.clearTimer();
+    if (this.createPromise) {
+      try { await this.createPromise; } catch { /* creation may throw */ }
+    }
+    if (this.resource !== null) {
+      const r = this.resource;
+      this.resource = null;
+      await this.config.dispose(r);
+    }
+  }
+
+  private clearTimer(): void {
+    if (this.idleTimer) {
+      clearTimeout(this.idleTimer);
+      this.idleTimer = null;
+    }
+  }
+}
+
+// =============================================================================
 // node-llama-cpp Implementation
 // =============================================================================
 
@@ -353,128 +475,172 @@ export type LlamaCppConfig = {
 const DEFAULT_INACTIVITY_TIMEOUT_MS = 5 * 60 * 1000;
 
 export class LlamaCpp implements LLM {
-  private llama: Llama | null = null;
-  private embedModel: LlamaModel | null = null;
-  private embedContexts: LlamaEmbeddingContext[] = [];
-  private generateModel: LlamaModel | null = null;
-  private rerankModel: LlamaModel | null = null;
-  private rerankContexts: Awaited<ReturnType<LlamaModel["createRankingContext"]>>[] = [];
+  // IdleResourceSlots (lazy-create + per-slot idle-evict)
+  private llamaSlot: IdleResourceSlot<Llama>;
+  private embedModelSlot: IdleResourceSlot<LlamaModel>;
+  private embedContextsSlot: IdleResourceSlot<LlamaEmbeddingContext[]>;
+  private generateModelSlot: IdleResourceSlot<LlamaModel>;
+  private rerankModelSlot: IdleResourceSlot<LlamaModel>;
+  private rerankContextsSlot: IdleResourceSlot<Awaited<ReturnType<LlamaModel["createRankingContext"]>>[]>;
+
+  // Simple nullable (trivial cost, no eviction needed)
+  private expandGrammar: LlamaGrammar | null = null;
 
   private embedModelUri: string;
   private generateModelUri: string;
   private rerankModelUri: string;
   private modelCacheDir: string;
 
-  // Ensure we don't load the same model/context concurrently (which can allocate duplicate VRAM).
-  private embedModelLoadPromise: Promise<LlamaModel> | null = null;
-  private generateModelLoadPromise: Promise<LlamaModel> | null = null;
-  private rerankModelLoadPromise: Promise<LlamaModel> | null = null;
-
-  // Inactivity timer for auto-unloading models
-  private inactivityTimer: ReturnType<typeof setTimeout> | null = null;
-  private inactivityTimeoutMs: number;
-  private disposeModelsOnInactivity: boolean;
-
   // Track disposal state to prevent double-dispose
   private disposed = false;
 
+  // Qwen3 reranker template adds ~200 tokens overhead (system prompt, tags, etc.)
+  // Chunks are max 800 tokens, so 800 + 200 + query ≈ 1100 tokens typical.
+  // Use 2048 for safety margin. Still 17× less than auto (40960).
+  private static readonly RERANK_CONTEXT_SIZE = 2048;
 
   constructor(config: LlamaCppConfig = {}) {
     this.embedModelUri = config.embedModel || DEFAULT_EMBED_MODEL;
     this.generateModelUri = config.generateModel || DEFAULT_GENERATE_MODEL;
     this.rerankModelUri = config.rerankModel || DEFAULT_RERANK_MODEL;
     this.modelCacheDir = config.modelCacheDir || MODEL_CACHE_DIR;
-    this.inactivityTimeoutMs = config.inactivityTimeoutMs ?? DEFAULT_INACTIVITY_TIMEOUT_MS;
-    this.disposeModelsOnInactivity = config.disposeModelsOnInactivity ?? false;
-  }
 
-  /**
-   * Reset the inactivity timer. Called after each model operation.
-   * When timer fires, models are unloaded to free memory (if no active sessions).
-   */
-  private touchActivity(): void {
-    // Clear existing timer
-    if (this.inactivityTimer) {
-      clearTimeout(this.inactivityTimer);
-      this.inactivityTimer = null;
-    }
+    const inactivityTimeoutMs = config.inactivityTimeoutMs ?? DEFAULT_INACTIVITY_TIMEOUT_MS;
+    const disposeModelsOnInactivity = config.disposeModelsOnInactivity ?? false;
+    const modelTimeoutMs = disposeModelsOnInactivity ? inactivityTimeoutMs : 0;
 
-    // Only set timer if we have disposable contexts and timeout is enabled
-    if (this.inactivityTimeoutMs > 0 && this.hasLoadedContexts()) {
-      this.inactivityTimer = setTimeout(() => {
-        // Check if session manager allows unloading
-        // canUnloadLLM is defined later in this file - it checks the session manager
-        // We use dynamic import pattern to avoid circular dependency issues
-        if (typeof canUnloadLLM === 'function' && !canUnloadLLM()) {
-          // Active sessions/operations - reschedule timer
-          this.touchActivity();
-          return;
+    // --- Llama instance (lightweight, never auto-evict) ---
+    this.llamaSlot = new IdleResourceSlot({
+      name: "llama",
+      create: () => this.initLlama(),
+      dispose: async (llama) => {
+        // llama.dispose() can hang indefinitely, so use a timeout
+        const p = llama.dispose();
+        const timeout = new Promise<void>(r => setTimeout(r, 2000));
+        await Promise.race([p, timeout]);
+      },
+      idleTimeoutMs: 0,
+    });
+
+    // --- Embed model ---
+    this.embedModelSlot = new IdleResourceSlot({
+      name: "embed-model",
+      create: async () => {
+        const llama = await this.llamaSlot.get();
+        const modelPath = await this.resolveModel(this.embedModelUri);
+        return llama.loadModel({ modelPath });
+      },
+      dispose: async (model) => {
+        await this.embedContextsSlot.evict();
+        await model.dispose();
+      },
+      idleTimeoutMs: modelTimeoutMs,
+      canEvict: () => canUnloadLLM() && !this.embedContextsSlot.isLoaded,
+    });
+
+    // --- Embed contexts (pool for parallel embedding) ---
+    this.embedContextsSlot = new IdleResourceSlot({
+      name: "embed-contexts",
+      create: async () => {
+        const model = await this.embedModelSlot.get();
+        // Embed contexts are ~143 MB each (nomic-embed 2048 ctx)
+        const n = await this.computeParallelism(150);
+        const threads = await this.threadsPerContext(n);
+        const contexts: LlamaEmbeddingContext[] = [];
+        for (let i = 0; i < n; i++) {
+          try {
+            contexts.push(await model.createEmbeddingContext({
+              ...(threads > 0 ? { threads } : {}),
+            }));
+          } catch {
+            if (contexts.length === 0) throw new Error("Failed to create any embedding context");
+            break;
+          }
         }
-        this.unloadIdleResources().catch(err => {
-          console.error("Error unloading idle resources:", err);
-        });
-      }, this.inactivityTimeoutMs);
-      // Don't keep process alive just for this timer
-      this.inactivityTimer.unref();
-    }
-  }
+        return contexts;
+      },
+      dispose: async (contexts) => {
+        for (const ctx of contexts) {
+          try { await ctx.dispose(); } catch { /* already disposed */ }
+        }
+      },
+      idleTimeoutMs: inactivityTimeoutMs,
+      canEvict: () => canUnloadLLM(),
+    });
 
-  /**
-   * Check if any contexts are currently loaded (and therefore worth unloading on inactivity).
-   */
-  private hasLoadedContexts(): boolean {
-    return !!(this.embedContexts.length > 0 || this.rerankContexts.length > 0);
-  }
+    // --- Generate model ---
+    this.generateModelSlot = new IdleResourceSlot({
+      name: "generate-model",
+      create: async () => {
+        const llama = await this.llamaSlot.get();
+        const modelPath = await this.resolveModel(this.generateModelUri);
+        return llama.loadModel({ modelPath });
+      },
+      dispose: async (model) => {
+        this.expandGrammar = null;
+        await model.dispose();
+      },
+      idleTimeoutMs: modelTimeoutMs,
+      canEvict: () => canUnloadLLM(),
+    });
 
-  /**
-   * Unload idle resources but keep the instance alive for future use.
-   *
-   * By default, this disposes contexts (and their dependent sequences), while keeping models loaded.
-   * This matches the intended lifecycle: model → context → sequence, where contexts are per-session.
-   */
-  async unloadIdleResources(): Promise<void> {
-    // Don't unload if already disposed
-    if (this.disposed) {
-      return;
-    }
+    // --- Rerank model ---
+    this.rerankModelSlot = new IdleResourceSlot({
+      name: "rerank-model",
+      create: async () => {
+        const llama = await this.llamaSlot.get();
+        const modelPath = await this.resolveModel(this.rerankModelUri);
+        return llama.loadModel({ modelPath });
+      },
+      dispose: async (model) => {
+        await this.rerankContextsSlot.evict();
+        await model.dispose();
+      },
+      idleTimeoutMs: modelTimeoutMs,
+      canEvict: () => canUnloadLLM() && !this.rerankContextsSlot.isLoaded,
+    });
 
-    // Clear timer
-    if (this.inactivityTimer) {
-      clearTimeout(this.inactivityTimer);
-      this.inactivityTimer = null;
-    }
-
-    // Dispose contexts first
-    for (const ctx of this.embedContexts) {
-      await ctx.dispose();
-    }
-    this.embedContexts = [];
-    for (const ctx of this.rerankContexts) {
-      await ctx.dispose();
-    }
-    this.rerankContexts = [];
-
-    // Optionally dispose models too (opt-in)
-    if (this.disposeModelsOnInactivity) {
-      if (this.embedModel) {
-        await this.embedModel.dispose();
-        this.embedModel = null;
-      }
-      if (this.generateModel) {
-        await this.generateModel.dispose();
-        this.generateModel = null;
-      }
-      if (this.rerankModel) {
-        await this.rerankModel.dispose();
-        this.rerankModel = null;
-      }
-      // Reset load promises so models can be reloaded later
-      this.embedModelLoadPromise = null;
-      this.generateModelLoadPromise = null;
-      this.rerankModelLoadPromise = null;
-    }
-
-    // Note: We keep llama instance alive - it's lightweight
+    // --- Rerank contexts (pool for parallel ranking) ---
+    this.rerankContextsSlot = new IdleResourceSlot({
+      name: "rerank-contexts",
+      create: async () => {
+        const model = await this.rerankModelSlot.get();
+        // ~960 MB per context with flash attention at contextSize 2048
+        const n = await this.computeParallelism(1000);
+        const threads = await this.threadsPerContext(n);
+        const contexts: Awaited<ReturnType<LlamaModel["createRankingContext"]>>[] = [];
+        for (let i = 0; i < n; i++) {
+          try {
+            contexts.push(await model.createRankingContext({
+              contextSize: LlamaCpp.RERANK_CONTEXT_SIZE,
+              flashAttention: true,
+              ...(threads > 0 ? { threads } : {}),
+            }));
+          } catch {
+            if (contexts.length === 0) {
+              // Flash attention might not be supported — retry without it
+              try {
+                contexts.push(await model.createRankingContext({
+                  contextSize: LlamaCpp.RERANK_CONTEXT_SIZE,
+                  ...(threads > 0 ? { threads } : {}),
+                }));
+              } catch {
+                throw new Error("Failed to create any rerank context");
+              }
+            }
+            break;
+          }
+        }
+        return contexts;
+      },
+      dispose: async (contexts) => {
+        for (const ctx of contexts) {
+          try { await ctx.dispose(); } catch { /* already disposed */ }
+        }
+      },
+      idleTimeoutMs: inactivityTimeoutMs,
+      canEvict: () => canUnloadLLM(),
+    });
   }
 
   /**
@@ -487,55 +653,52 @@ export class LlamaCpp implements LLM {
   }
 
   /**
-   * Initialize the llama instance (lazy)
+   * Create and return a new llama instance (called by llamaSlot.create).
    */
-  private async ensureLlama(): Promise<Llama> {
-    if (!this.llama) {
-      const VALID_DEVICES = ["cpu", "cuda", "metal", "vulkan"] as const;
-      type Device = (typeof VALID_DEVICES)[number];
-      const deviceEnv = process.env.QMD_DEVICE?.toLowerCase().trim();
+  private async initLlama(): Promise<Llama> {
+    const VALID_DEVICES = ["cpu", "cuda", "metal", "vulkan"] as const;
+    type Device = (typeof VALID_DEVICES)[number];
+    const deviceEnv = process.env.QMD_DEVICE?.toLowerCase().trim();
 
-      let llama: Llama;
+    let llama: Llama;
 
-      if (deviceEnv) {
-        // Explicit device override via QMD_DEVICE
-        if (!VALID_DEVICES.includes(deviceEnv as Device)) {
-          throw new Error(
-            `QMD_DEVICE="${process.env.QMD_DEVICE}" is not valid. Valid options: ${VALID_DEVICES.join(", ")}`
-          );
-        }
-        const gpu = deviceEnv === "cpu" ? false : (deviceEnv as "cuda" | "metal" | "vulkan");
-        llama = await getLlama({ gpu, logLevel: LlamaLogLevel.error });
-      } else {
-        // Auto-detect: prefer CUDA > Metal > Vulkan > CPU.
-        // We can't rely on gpu:"auto" — it returns false even when CUDA is available
-        // (likely a binary/build config issue in node-llama-cpp).
-        const gpuTypes = await getLlamaGpuTypes();
-        const preferred = (["cuda", "metal", "vulkan"] as const).find(g => gpuTypes.includes(g));
+    if (deviceEnv) {
+      // Explicit device override via QMD_DEVICE
+      if (!VALID_DEVICES.includes(deviceEnv as Device)) {
+        throw new Error(
+          `QMD_DEVICE="${process.env.QMD_DEVICE}" is not valid. Valid options: ${VALID_DEVICES.join(", ")}`
+        );
+      }
+      const gpu = deviceEnv === "cpu" ? false : (deviceEnv as "cuda" | "metal" | "vulkan");
+      llama = await getLlama({ gpu, logLevel: LlamaLogLevel.error });
+    } else {
+      // Auto-detect: prefer CUDA > Metal > Vulkan > CPU.
+      // We can't rely on gpu:"auto" — it returns false even when CUDA is available
+      // (likely a binary/build config issue in node-llama-cpp).
+      const gpuTypes = await getLlamaGpuTypes();
+      const preferred = (["cuda", "metal", "vulkan"] as const).find(g => gpuTypes.includes(g));
 
-        if (preferred) {
-          try {
-            llama = await getLlama({ gpu: preferred, logLevel: LlamaLogLevel.error });
-          } catch {
-            llama = await getLlama({ gpu: false, logLevel: LlamaLogLevel.error });
-            process.stderr.write(
-              `QMD Warning: ${preferred} reported available but failed to initialize. Falling back to CPU.\n`
-            );
-          }
-        } else {
+      if (preferred) {
+        try {
+          llama = await getLlama({ gpu: preferred, logLevel: LlamaLogLevel.error });
+        } catch {
           llama = await getLlama({ gpu: false, logLevel: LlamaLogLevel.error });
-        }
-
-        if (!llama.gpu) {
           process.stderr.write(
-            "QMD Warning: no GPU acceleration, running on CPU (slow). Run 'qmd status' for details.\n"
+            `QMD Warning: ${preferred} reported available but failed to initialize. Falling back to CPU.\n`
           );
         }
+      } else {
+        llama = await getLlama({ gpu: false, logLevel: LlamaLogLevel.error });
       }
 
-      this.llama = llama;
+      if (!llama.gpu) {
+        process.stderr.write(
+          "QMD Warning: no GPU acceleration, running on CPU (slow). Run 'qmd status' for details.\n"
+        );
+      }
     }
-    return this.llama;
+
+    return llama;
   }
 
   /**
@@ -548,35 +711,6 @@ export class LlamaCpp implements LLM {
   }
 
   /**
-   * Load embedding model (lazy)
-   */
-  private async ensureEmbedModel(): Promise<LlamaModel> {
-    if (this.embedModel) {
-      return this.embedModel;
-    }
-    if (this.embedModelLoadPromise) {
-      return await this.embedModelLoadPromise;
-    }
-
-    this.embedModelLoadPromise = (async () => {
-      const llama = await this.ensureLlama();
-      const modelPath = await this.resolveModel(this.embedModelUri);
-      const model = await llama.loadModel({ modelPath });
-      this.embedModel = model;
-      // Model loading counts as activity - ping to keep alive
-      this.touchActivity();
-      return model;
-    })();
-
-    try {
-      return await this.embedModelLoadPromise;
-    } finally {
-      // Keep the resolved model cached; clear only the in-flight promise.
-      this.embedModelLoadPromise = null;
-    }
-  }
-
-  /**
    * Compute how many parallel contexts to create.
    *
    * GPU: constrained by VRAM (25% of free, capped at 8).
@@ -585,12 +719,13 @@ export class LlamaCpp implements LLM {
    *      half the math cores, with at least 4 threads per context.
    */
   private async computeParallelism(perContextMB: number): Promise<number> {
-    const llama = await this.ensureLlama();
+    const llama = await this.llamaSlot.get();
 
-    // GPU: one context per device, capped by QMD_MAX_CONTEXTS
+    const cap = parseInt(process.env.QMD_MAX_CONTEXTS || "0", 10);
+
+    // GPU: one context per device
     if (llama.gpu) {
       const gpuDevices = await llama.getGpuDeviceNames();
-      const cap = parseInt(process.env.QMD_MAX_CONTEXTS || "0", 10);
       const n = Math.max(1, gpuDevices.length);
       return cap > 0 ? Math.min(n, cap) : n;
     }
@@ -598,7 +733,8 @@ export class LlamaCpp implements LLM {
     // CPU: split cores across contexts. At least 4 threads per context.
     const cores = llama.cpuMathCores || 4;
     const maxContexts = Math.floor(cores / 4);
-    return Math.max(1, Math.min(4, maxContexts));
+    const n = Math.max(1, Math.min(4, maxContexts));
+    return cap > 0 ? Math.min(n, cap) : n;
   }
 
   /**
@@ -606,166 +742,30 @@ export class LlamaCpp implements LLM {
    * Splits available math cores evenly across contexts.
    */
   private async threadsPerContext(parallelism: number): Promise<number> {
-    const llama = await this.ensureLlama();
+    const llama = await this.llamaSlot.get();
     if (llama.gpu) return 0; // GPU: let the library decide
     const cores = llama.cpuMathCores || 4;
     return Math.max(1, Math.floor(cores / parallelism));
   }
 
   /**
-   * Load embedding contexts (lazy). Creates multiple for parallel embedding.
-   * Uses promise guard to prevent concurrent context creation race condition.
+   * Get or create the cached expand grammar (GBNF compiled once).
    */
-  private embedContextsCreatePromise: Promise<LlamaEmbeddingContext[]> | null = null;
-
-  private async ensureEmbedContexts(): Promise<LlamaEmbeddingContext[]> {
-    if (this.embedContexts.length > 0) {
-      this.touchActivity();
-      return this.embedContexts;
+  private async ensureExpandGrammar(): Promise<LlamaGrammar> {
+    if (!this.expandGrammar) {
+      const llama = await this.llamaSlot.get();
+      this.expandGrammar = await llama.createGrammar({
+        grammar: `
+          root ::= line+
+          line ::= type ": " content "\\n"
+          type ::= "lex" | "vec" | "hyde"
+          content ::= [^\\n]+
+        `
+      });
     }
-
-    if (this.embedContextsCreatePromise) {
-      return await this.embedContextsCreatePromise;
-    }
-
-    this.embedContextsCreatePromise = (async () => {
-      const model = await this.ensureEmbedModel();
-      // Embed contexts are ~143 MB each (nomic-embed 2048 ctx)
-      const n = await this.computeParallelism(150);
-      const threads = await this.threadsPerContext(n);
-      for (let i = 0; i < n; i++) {
-        try {
-          this.embedContexts.push(await model.createEmbeddingContext({
-            ...(threads > 0 ? { threads } : {}),
-          }));
-        } catch {
-          if (this.embedContexts.length === 0) throw new Error("Failed to create any embedding context");
-          break;
-        }
-      }
-      this.touchActivity();
-      return this.embedContexts;
-    })();
-
-    try {
-      return await this.embedContextsCreatePromise;
-    } finally {
-      this.embedContextsCreatePromise = null;
-    }
+    return this.expandGrammar;
   }
 
-  /**
-   * Get a single embed context (for single-embed calls). Uses first from pool.
-   */
-  private async ensureEmbedContext(): Promise<LlamaEmbeddingContext> {
-    const contexts = await this.ensureEmbedContexts();
-    return contexts[0]!;
-  }
-
-  /**
-   * Load generation model (lazy) - context is created fresh per call
-   */
-  private async ensureGenerateModel(): Promise<LlamaModel> {
-    if (!this.generateModel) {
-      if (this.generateModelLoadPromise) {
-        return await this.generateModelLoadPromise;
-      }
-
-      this.generateModelLoadPromise = (async () => {
-        const llama = await this.ensureLlama();
-        const modelPath = await this.resolveModel(this.generateModelUri);
-        const model = await llama.loadModel({ modelPath });
-        this.generateModel = model;
-        return model;
-      })();
-
-      try {
-        await this.generateModelLoadPromise;
-      } finally {
-        this.generateModelLoadPromise = null;
-      }
-    }
-    this.touchActivity();
-    if (!this.generateModel) {
-      throw new Error("Generate model not loaded");
-    }
-    return this.generateModel;
-  }
-
-  /**
-   * Load rerank model (lazy)
-   */
-  private async ensureRerankModel(): Promise<LlamaModel> {
-    if (this.rerankModel) {
-      return this.rerankModel;
-    }
-    if (this.rerankModelLoadPromise) {
-      return await this.rerankModelLoadPromise;
-    }
-
-    this.rerankModelLoadPromise = (async () => {
-      const llama = await this.ensureLlama();
-      const modelPath = await this.resolveModel(this.rerankModelUri);
-      const model = await llama.loadModel({ modelPath });
-      this.rerankModel = model;
-      // Model loading counts as activity - ping to keep alive
-      this.touchActivity();
-      return model;
-    })();
-
-    try {
-      return await this.rerankModelLoadPromise;
-    } finally {
-      this.rerankModelLoadPromise = null;
-    }
-  }
-
-  /**
-   * Load rerank contexts (lazy). Creates multiple contexts for parallel ranking.
-   * Each context has its own sequence, so they can evaluate independently.
-   *
-   * Tuning choices:
-   * - contextSize 1024: reranking chunks are ~800 tokens max, 1024 is plenty
-   * - flashAttention: ~20% less VRAM per context (568 vs 711 MB)
-   * - Combined: drops from 11.6 GB (auto, no flash) to 568 MB per context (20×)
-   */
-  // Qwen3 reranker template adds ~200 tokens overhead (system prompt, tags, etc.)
-  // Chunks are max 800 tokens, so 800 + 200 + query ≈ 1100 tokens typical.
-  // Use 2048 for safety margin. Still 17× less than auto (40960).
-  private static readonly RERANK_CONTEXT_SIZE = 2048;
-
-  private async ensureRerankContexts(): Promise<Awaited<ReturnType<LlamaModel["createRankingContext"]>>[]> {
-    if (this.rerankContexts.length === 0) {
-      const model = await this.ensureRerankModel();
-      // ~960 MB per context with flash attention at contextSize 2048
-      const n = await this.computeParallelism(1000);
-      const threads = await this.threadsPerContext(n);
-      for (let i = 0; i < n; i++) {
-        try {
-          this.rerankContexts.push(await model.createRankingContext({
-            contextSize: LlamaCpp.RERANK_CONTEXT_SIZE,
-            flashAttention: true,
-            ...(threads > 0 ? { threads } : {}),
-          }));
-        } catch {
-          if (this.rerankContexts.length === 0) {
-            // Flash attention might not be supported — retry without it
-            try {
-              this.rerankContexts.push(await model.createRankingContext({
-                contextSize: LlamaCpp.RERANK_CONTEXT_SIZE,
-                ...(threads > 0 ? { threads } : {}),
-              }));
-            } catch {
-              throw new Error("Failed to create any rerank context");
-            }
-          }
-          break;
-        }
-      }
-    }
-    this.touchActivity();
-    return this.rerankContexts;
-  }
 
   // ==========================================================================
   // Tokenization
@@ -776,30 +776,23 @@ export class LlamaCpp implements LLM {
    * Returns tokenizer tokens (opaque type from node-llama-cpp)
    */
   async tokenize(text: string): Promise<readonly LlamaToken[]> {
-    await this.ensureEmbedContext();  // Ensure model is loaded
-    if (!this.embedModel) {
-      throw new Error("Embed model not loaded");
-    }
-    return this.embedModel.tokenize(text);
+    const model = await this.embedModelSlot.get();
+    return model.tokenize(text);
   }
 
   /**
    * Count tokens in text using the embedding model's tokenizer
    */
   async countTokens(text: string): Promise<number> {
-    const tokens = await this.tokenize(text);
-    return tokens.length;
+    return (await this.tokenize(text)).length;
   }
 
   /**
    * Detokenize token IDs back to text
    */
   async detokenize(tokens: readonly LlamaToken[]): Promise<string> {
-    await this.ensureEmbedContext();
-    if (!this.embedModel) {
-      throw new Error("Embed model not loaded");
-    }
-    return this.embedModel.detokenize(tokens);
+    const model = await this.embedModelSlot.get();
+    return model.detokenize(tokens);
   }
 
   // ==========================================================================
@@ -807,13 +800,9 @@ export class LlamaCpp implements LLM {
   // ==========================================================================
 
   async embed(text: string, options: EmbedOptions = {}): Promise<EmbeddingResult | null> {
-    // Ping activity at start to keep models alive during this operation
-    this.touchActivity();
-
     try {
-      const context = await this.ensureEmbedContext();
+      const context = (await this.embedContextsSlot.get())[0]!;
       const embedding = await context.getEmbeddingFor(text);
-
       return {
         embedding: Array.from(embedding.vector),
         model: this.embedModelUri,
@@ -829,13 +818,10 @@ export class LlamaCpp implements LLM {
    * Uses Promise.all for parallel embedding - node-llama-cpp handles batching internally
    */
   async embedBatch(texts: string[]): Promise<(EmbeddingResult | null)[]> {
-    // Ping activity at start to keep models alive during this operation
-    this.touchActivity();
-
     if (texts.length === 0) return [];
 
     try {
-      const contexts = await this.ensureEmbedContexts();
+      const contexts = await this.embedContextsSlot.get();
       const n = contexts.length;
 
       if (n === 1) {
@@ -845,7 +831,7 @@ export class LlamaCpp implements LLM {
         for (const text of texts) {
           try {
             const embedding = await context.getEmbeddingFor(text);
-            this.touchActivity();
+            this.embedContextsSlot.touch();
             embeddings.push({ embedding: Array.from(embedding.vector), model: this.embedModelUri });
           } catch (err) {
             console.error("Embedding error for text:", err);
@@ -868,7 +854,7 @@ export class LlamaCpp implements LLM {
           for (const text of chunk) {
             try {
               const embedding = await ctx.getEmbeddingFor(text);
-              this.touchActivity();
+              this.embedContextsSlot.touch();
               results.push({ embedding: Array.from(embedding.vector), model: this.embedModelUri });
             } catch (err) {
               console.error("Embedding error for text:", err);
@@ -887,14 +873,10 @@ export class LlamaCpp implements LLM {
   }
 
   async generate(prompt: string, options: GenerateOptions = {}): Promise<GenerateResult | null> {
-    // Ping activity at start to keep models alive during this operation
-    this.touchActivity();
-
-    // Ensure model is loaded
-    await this.ensureGenerateModel();
+    const model = await this.generateModelSlot.get();
 
     // Create fresh context -> sequence -> session for each call
-    const context = await this.generateModel!.createContext();
+    const context = await model.createContext();
     const sequence = context.getSequence();
     const session = new LlamaChatSession({ contextSequence: sequence });
 
@@ -946,30 +928,17 @@ export class LlamaCpp implements LLM {
   // ==========================================================================
 
   async expandQuery(query: string, options: { context?: string, includeLexical?: boolean } = {}): Promise<Queryable[]> {
-    // Ping activity at start to keep models alive during this operation
-    this.touchActivity();
-
-    const llama = await this.ensureLlama();
-    await this.ensureGenerateModel();
-
     const includeLexical = options.includeLexical ?? true;
-    const context = options.context;
 
-    const grammar = await llama.createGrammar({
-      grammar: `
-        root ::= line+
-        line ::= type ": " content "\\n"
-        type ::= "lex" | "vec" | "hyde"
-        content ::= [^\\n]+
-      `
-    });
+    const grammar = await this.ensureExpandGrammar();
+    // Fresh context per call — LlamaChatSession accumulates chat history into
+    // the KV cache, so reusing a context across calls pollutes subsequent runs.
+    const model = await this.generateModelSlot.get();
+    const context = await model.createContext();
+    const sequence = context.getSequence();
+    const session = new LlamaChatSession({ contextSequence: sequence });
 
     const prompt = `/no_think Expand this search query: ${query}`;
-
-    // Create fresh context for each call
-    const genContext = await this.generateModel!.createContext();
-    const sequence = genContext.getSequence();
-    const session = new LlamaChatSession({ contextSequence: sequence });
 
     try {
       // Qwen3 recommended settings for non-thinking mode:
@@ -1024,7 +993,8 @@ export class LlamaCpp implements LLM {
       if (includeLexical) fallback.unshift({ type: 'lex', text: query });
       return fallback;
     } finally {
-      await genContext.dispose();
+      // Dispose context (which disposes dependent sequences per lifecycle rules)
+      await context.dispose();
     }
   }
 
@@ -1033,10 +1003,7 @@ export class LlamaCpp implements LLM {
     documents: RerankDocument[],
     options: RerankOptions = {}
   ): Promise<RerankResult> {
-    // Ping activity at start to keep models alive during this operation
-    this.touchActivity();
-
-    const contexts = await this.ensureRerankContexts();
+    const contexts = await this.rerankContextsSlot.get();
 
     // Build a map from document text to original indices (for lookup after sorting)
     const textToDoc = new Map<string, { file: string; index: number }>();
@@ -1093,7 +1060,7 @@ export class LlamaCpp implements LLM {
     vram?: { total: number; used: number; free: number };
     cpuCores: number;
   }> {
-    const llama = await this.ensureLlama();
+    const llama = await this.llamaSlot.get();
     const gpuDevices = await llama.getGpuDeviceNames();
     let vram: { total: number; used: number; free: number } | undefined;
     if (llama.gpu) {
@@ -1116,44 +1083,45 @@ export class LlamaCpp implements LLM {
    * Returns 0 for contexts that haven't been lazily created yet.
    */
   getContextCounts(): { embed: number; rerank: number } {
-    return { embed: this.embedContexts.length, rerank: this.rerankContexts.length };
+    return {
+      embed: this.embedContextsSlot.current?.length ?? 0,
+      rerank: this.rerankContextsSlot.current?.length ?? 0,
+    };
+  }
+
+  /**
+   * Force-evict idle resources (contexts, optionally models) without waiting
+   * for timers. Useful for tests and manual VRAM management. Resources reload
+   * transparently on next use.
+   */
+  async evictIdle(): Promise<void> {
+    if (this.disposed) return;
+    await this.embedContextsSlot.evict();
+    await this.rerankContextsSlot.evict();
+    this.expandGrammar = null;
   }
 
   async dispose(): Promise<void> {
-    // Prevent double-dispose
-    if (this.disposed) {
-      return;
-    }
+    if (this.disposed) return;
     this.disposed = true;
 
-    // Clear inactivity timer
-    if (this.inactivityTimer) {
-      clearTimeout(this.inactivityTimer);
-      this.inactivityTimer = null;
-    }
-
-    // Disposing llama cascades to models and contexts automatically
+    // Dispose in reverse order of creation: contexts → models → llama.
+    // This follows node-llama-cpp's required disposal hierarchy to avoid
+    // dangling native references and NAPI crashes on exit.
     // See: https://node-llama-cpp.withcat.ai/guide/objects-lifecycle
-    // Note: llama.dispose() can hang indefinitely, so we use a timeout
-    if (this.llama) {
-      const disposePromise = this.llama.dispose();
-      const timeoutPromise = new Promise<void>((resolve) => setTimeout(resolve, 1000));
-      await Promise.race([disposePromise, timeoutPromise]);
-    }
 
-    // Clear references
-    this.embedContexts = [];
-    this.rerankContexts = [];
-    this.embedModel = null;
-    this.generateModel = null;
-    this.rerankModel = null;
-    this.llama = null;
+    // 1. Context pools first (depend on models)
+    await this.embedContextsSlot.dispose();
+    await this.rerankContextsSlot.dispose();
+    this.expandGrammar = null;
 
-    // Clear any in-flight load/create promises
-    this.embedModelLoadPromise = null;
-    this.embedContextsCreatePromise = null;
-    this.generateModelLoadPromise = null;
-    this.rerankModelLoadPromise = null;
+    // 2. Models next (depend on llama)
+    await this.embedModelSlot.dispose();
+    await this.generateModelSlot.dispose();
+    await this.rerankModelSlot.dispose();
+
+    // 3. Llama last (owns the GPU context)
+    await this.llamaSlot.dispose();
   }
 }
 

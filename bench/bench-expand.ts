@@ -78,7 +78,7 @@ async function main() {
   const initT0 = performance.now();
   await llm.expandQuery("warmup query");
   const initMs = performance.now() - initT0;
-  console.log(`  Model loaded in ${initMs.toFixed(0)}ms (creates fresh context per call)`);
+  console.log(`  Model loaded in ${initMs.toFixed(0)}ms (fresh context per call)`);
 
   // Benchmark
   console.log(`\nBenchmark (1 cold + ${ITERATIONS} warm iteration${ITERATIONS > 1 ? "s" : ""} per query)\n`);

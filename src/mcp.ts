@@ -532,6 +532,21 @@ export async function startMcpServer(): Promise<void> {
   const server = createMcpServer(store);
   const transport = new StdioServerTransport();
   await server.connect(transport);
+
+  // Graceful shutdown for stdio transport: when the parent process closes
+  // stdin or sends a signal, dispose LLM resources before exiting to
+  // prevent NAPI crashes from native llama resources freed out of order.
+  let stopping = false;
+  const stop = async () => {
+    if (stopping) return;
+    stopping = true;
+    try { await transport.close?.(); } catch { /* best-effort */ }
+    store.close();
+    await disposeDefaultLlamaCpp();
+    process.exit(0);
+  };
+  process.on("SIGTERM", stop);
+  process.on("SIGINT", stop);
 }
 
 // =============================================================================
@@ -631,16 +646,13 @@ export async function startMcpHttpServer(port: number, options?: { quiet?: boole
     await disposeDefaultLlamaCpp();
   };
 
-  process.on("SIGTERM", async () => {
-    console.error("Shutting down (SIGTERM)...");
+  const signalHandler = async (signal: string) => {
+    console.error(`Shutting down (${signal})...`);
     await stop();
     process.exit(0);
-  });
-  process.on("SIGINT", async () => {
-    console.error("Shutting down (SIGINT)...");
-    await stop();
-    process.exit(0);
-  });
+  };
+  process.on("SIGTERM", () => signalHandler("SIGTERM"));
+  process.on("SIGINT", () => signalHandler("SIGINT"));
 
   log(`QMD MCP server listening on http://localhost:${actualPort}/mcp`);
   return { httpServer, port: actualPort, stop };

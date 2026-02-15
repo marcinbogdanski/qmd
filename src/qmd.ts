@@ -146,9 +146,22 @@ const cursor = {
   show() { process.stderr.write('\x1b[?25h'); },
 };
 
-// Ensure cursor is restored on exit
-process.on('SIGINT', () => { cursor.show(); process.exit(130); });
-process.on('SIGTERM', () => { cursor.show(); process.exit(143); });
+// Graceful shutdown: dispose LLM resources and close DB before exit.
+// Without this, SIGINT during embed/query causes NAPI crashes from
+// native llama resources being freed out of order by the runtime.
+let shuttingDown = false;
+async function gracefulShutdown(code: number): Promise<void> {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  cursor.show();
+  try {
+    closeDb();
+    await disposeDefaultLlamaCpp();
+  } catch { /* best-effort during shutdown */ }
+  process.exit(code);
+}
+process.on('SIGINT', () => { gracefulShutdown(130); });
+process.on('SIGTERM', () => { gracefulShutdown(143); });
 
 // Terminal progress bar using OSC 9;4 escape sequence
 const progress = {
@@ -2514,7 +2527,10 @@ if (import.meta.main) {
           throw e;
         }
       } else {
-        // Default: stdio transport
+        // Stdio mode — remove top-level handlers so the MCP server's
+        // async cleanup handlers run instead.
+        process.removeAllListeners("SIGTERM");
+        process.removeAllListeners("SIGINT");
         const { startMcpServer } = await import("./mcp.js");
         await startMcpServer();
       }
@@ -2557,6 +2573,7 @@ if (import.meta.main) {
   }
 
   if (cli.command !== "mcp") {
+    closeDb();
     await disposeDefaultLlamaCpp();
     process.exit(0);
   }

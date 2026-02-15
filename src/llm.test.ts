@@ -173,40 +173,27 @@ describe("LlamaCpp Integration", () => {
     });
 
     test("handles concurrent embedBatch calls on fresh instance without race condition", async () => {
-      // This test verifies the fix for a race condition where concurrent calls to
-      // ensureEmbedContext() could create multiple contexts. Without the promise guard,
-      // each concurrent embedBatch call sees embedContext === null and creates its own
-      // context, causing resource leaks and potential "Context is disposed" errors.
-      //
+      // This test verifies that IdleResourceSlot's promise dedup prevents concurrent
+      // calls to embedBatch from creating duplicate context pools.
       // See: https://github.com/tobi/qmd/pull/54
-      //
-      // The fix uses a promise guard to ensure only one context creation runs at a time.
-      // We verify this by instrumenting createEmbeddingContext to count invocations.
-      
+
       const freshLlm = new LlamaCpp({});
-      let contextCreateCount = 0;
-      
-      // Instrument the model's createEmbeddingContext to count calls
-      const originalEnsureEmbedModel = (freshLlm as any).ensureEmbedModel.bind(freshLlm);
-      let modelInstrumented = false;
-      (freshLlm as any).ensureEmbedModel = async function() {
-        const model = await originalEnsureEmbedModel();
-        if (!modelInstrumented) {
-          modelInstrumented = true;
-          const originalCreate = model.createEmbeddingContext.bind(model);
-          model.createEmbeddingContext = async function(...args: any[]) {
-            contextCreateCount++;
-            return originalCreate(...args);
-          };
-        }
-        return model;
+      let slotCreateCount = 0;
+
+      // Instrument the embed contexts slot to count create invocations.
+      // With promise dedup, concurrent get() calls should trigger create() exactly once.
+      const slot = (freshLlm as any).embedContextsSlot;
+      const originalCreate = slot.config.create;
+      slot.config.create = async () => {
+        slotCreateCount++;
+        return originalCreate();
       };
-      
+
       const texts = Array(10).fill(null).map((_, i) => `Document ${i}`);
 
       // Call embedBatch 5 TIMES in parallel on fresh instance.
-      // Without the promise guard fix, this would create 5 contexts (one per call).
-      // With the fix, only 1 context should be created.
+      // Without promise dedup, this would invoke create() 5 times.
+      // With dedup, create() runs exactly once.
       const batches = await Promise.all([
         freshLlm.embedBatch(texts.slice(0, 2)),
         freshLlm.embedBatch(texts.slice(2, 4)),
@@ -217,20 +204,97 @@ describe("LlamaCpp Integration", () => {
 
       const allResults = batches.flat();
       expect(allResults).toHaveLength(10);
-      
+
       const successCount = allResults.filter(r => r !== null).length;
       expect(successCount).toBe(10);
 
-      // THE KEY ASSERTION: Contexts should be created once (by ensureEmbedContexts),
-      // not duplicated per concurrent embedBatch call. The exact count depends on
-      // available VRAM (computeParallelism), but should not be 5 (one per call).
-      // Without the fix, contextCreateCount would be 5× the intended count (one set per concurrent call).
-      // With the promise guard, contexts are created exactly once regardless of concurrent callers.
-      // The count depends on VRAM (computeParallelism), but should be ≤ 8 (the cap).
-      console.log(`Context creation count: ${contextCreateCount} (expected: ≤ 8, not 5× duplicated)`);
-      expect(contextCreateCount).toBeGreaterThanOrEqual(1);
-      expect(contextCreateCount).toBeLessThanOrEqual(8);
-      
+      // THE KEY ASSERTION: The slot's create callback was invoked exactly once
+      // despite 5 concurrent embedBatch callers.
+      console.log(`Slot create count: ${slotCreateCount} (expected: 1)`);
+      expect(slotCreateCount).toBe(1);
+
+      await freshLlm.dispose();
+    }, 60000);
+  });
+
+  describe("idle eviction and auto-reload", () => {
+    test("evictIdle unloads contexts, then next call reloads transparently", async () => {
+      const freshLlm = new LlamaCpp({});
+      const embedSlot = (freshLlm as any).embedContextsSlot;
+
+      // 1. Prime: embed something to force context creation
+      const first = await freshLlm.embed("hello world");
+      expect(first).not.toBeNull();
+      expect(first!.embedding.length).toBe(768);
+      expect(embedSlot.isLoaded).toBe(true);
+
+      // 2. Force-evict (simulates idle timeout firing)
+      await freshLlm.evictIdle();
+      expect(embedSlot.isLoaded).toBe(false);
+
+      // 3. Embed again — should reload contexts transparently
+      const second = await freshLlm.embed("hello world");
+      expect(second).not.toBeNull();
+      expect(second!.embedding.length).toBe(768);
+      expect(embedSlot.isLoaded).toBe(true);
+
+      // Embeddings should be identical (same model, same input)
+      for (let i = 0; i < first!.embedding.length; i++) {
+        expect(first!.embedding[i]).toBeCloseTo(second!.embedding[i]!, 5);
+      }
+
+      await freshLlm.dispose();
+    }, 60000);
+
+    test("evicting one slot does not affect the other", async () => {
+      const freshLlm = new LlamaCpp({});
+      const embedSlot = (freshLlm as any).embedContextsSlot;
+      const rerankSlot = (freshLlm as any).rerankContextsSlot;
+
+      // Prime both embed and rerank
+      await freshLlm.embed("test");
+      await freshLlm.rerank("test", [{ file: "a.txt", text: "content" }]);
+
+      // Both loaded (re-prime embed in case it idled during rerank model load)
+      await freshLlm.embed("prime");
+      expect(embedSlot.isLoaded).toBe(true);
+      expect(rerankSlot.isLoaded).toBe(true);
+
+      // Evict only rerank — embed should be unaffected
+      await rerankSlot.evict();
+      expect(rerankSlot.isLoaded).toBe(false);
+      expect(embedSlot.isLoaded).toBe(true);
+
+      // Rerank reloads transparently
+      const result = await freshLlm.rerank("test", [{ file: "a.txt", text: "content" }]);
+      expect(result.results).toHaveLength(1);
+      expect(rerankSlot.isLoaded).toBe(true);
+
+      // Embed was never disrupted
+      const embedResult = await freshLlm.embed("still loaded");
+      expect(embedResult).not.toBeNull();
+      expect(embedResult!.embedding.length).toBe(768);
+
+      await freshLlm.dispose();
+    }, 60000);
+
+    test("idle timer auto-evicts after timeout", async () => {
+      // Short timeout to verify the timer actually fires and evicts
+      const freshLlm = new LlamaCpp({ inactivityTimeoutMs: 50 });
+      const embedSlot = (freshLlm as any).embedContextsSlot;
+
+      await freshLlm.embed("prime");
+      expect(embedSlot.isLoaded).toBe(true);
+
+      // Wait for idle timer to fire
+      await new Promise(resolve => setTimeout(resolve, 150));
+      expect(embedSlot.isLoaded).toBe(false);
+
+      // Still works after auto-eviction
+      const result = await freshLlm.embed("after eviction");
+      expect(result).not.toBeNull();
+      expect(result!.embedding.length).toBe(768);
+
       await freshLlm.dispose();
     }, 60000);
   });
