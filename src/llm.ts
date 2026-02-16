@@ -1394,7 +1394,7 @@ export function getDefaultLlamaCpp(): LlamaCpp {
 
 /**
  * Get the default LLM backend instance.
- * Currently this is LlamaCpp; kept as a separate seam for future backends.
+ * Selects local or API backend based on QMD_LLM_BACKEND.
  */
 export function getDefaultLLM(): LLM {
   const backend = (process.env.QMD_LLM_BACKEND || "local").toLowerCase();
@@ -1403,10 +1403,7 @@ export function getDefaultLLM(): LLM {
   }
 
   if (!defaultApiLLM) {
-    defaultApiLLM = new ApiLLM({
-      // During phased rollout, non-embedding methods can delegate to local backend.
-      fallbackLLM: getDefaultLlamaCpp(),
-    });
+    defaultApiLLM = new ApiLLM();
   }
   return defaultApiLLM;
 }
@@ -1416,7 +1413,7 @@ export function getDefaultLLM(): LLM {
  */
 export function setDefaultLlamaCpp(llm: LlamaCpp | null): void {
   defaultLlamaCpp = llm;
-  // Clear API wrapper so it can rebuild with the new fallback instance.
+  // Clear API wrapper so backend singletons can be rebuilt deterministically in tests.
   defaultApiLLM = null;
 }
 
