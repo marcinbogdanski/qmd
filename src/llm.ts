@@ -1397,15 +1397,21 @@ export function getDefaultLlamaCpp(): LlamaCpp {
  * Selects local or API backend based on QMD_LLM_BACKEND.
  */
 export function getDefaultLLM(): LLM {
-  const backend = (process.env.QMD_LLM_BACKEND || "local").toLowerCase();
-  if (backend !== "api") {
+  const backend = process.env.QMD_LLM_BACKEND?.trim().toLowerCase() || "local";
+  if (backend === "local") {
     return getDefaultLlamaCpp();
   }
 
-  if (!defaultApiLLM) {
-    defaultApiLLM = new ApiLLM();
+  if (backend === "api") {
+    if (!defaultApiLLM) {
+      defaultApiLLM = new ApiLLM();
+    }
+    return defaultApiLLM;
   }
-  return defaultApiLLM;
+
+  throw new Error(
+    `Invalid QMD_LLM_BACKEND="${process.env.QMD_LLM_BACKEND}". Expected "local" or "api".`
+  );
 }
 
 /**
@@ -1413,7 +1419,7 @@ export function getDefaultLLM(): LLM {
  */
 export function setDefaultLlamaCpp(llm: LlamaCpp | null): void {
   defaultLlamaCpp = llm;
-  // Clear API wrapper so backend singletons can be rebuilt deterministically in tests.
+  // Function appears unused - clearing defaultApiLLM probably right thing to do anyway?
   defaultApiLLM = null;
 }
 
